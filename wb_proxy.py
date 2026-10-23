@@ -14775,24 +14775,21 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 if session_key and POOL:
                     POOL.affinity.demote(session_key, account.uid)
                 detail = http_error_detail(exc, 2048)
-                # OAuth accounts get a refresh attempt below; that attempt
-                # counts its own 401 body, so the same request is not counted
-                # twice. API keys / accounts without a refresh token have no
-                # such fallback, so they count here.
-                if (not getattr(account, "refresh_token", "")
-                        or getattr(account, "is_api_key", False)):
-                    if account.note_auth_rejected(detail):
-                        log("account %s disabled permanently after %d consecutive "
-                            "401 Authorization Required"
-                            % (account.uid[:8],
-                               wb_accounts.AUTH_REJECT_THRESHOLD),
-                            level="ERROR")
-                        last_error = exc
-                        continue
+                # Count the chat body for every account. The refresh attempt
+                # below must not count the same request again (its 401 body is
+                # not always this HTML page anyway), so it disables counting.
+                if account.note_auth_rejected(detail):
+                    log("account %s disabled permanently after %d consecutive "
+                        "401 Authorization Required"
+                        % (account.uid[:8],
+                           wb_accounts.AUTH_REJECT_THRESHOLD),
+                        level="ERROR")
+                    last_error = exc
+                    continue
                 if account.uid not in refreshed:
                     refreshed.add(account.uid)
                     try:
-                        refreshed_ok = account.refresh()
+                        refreshed_ok = account.refresh(count_auth_reject=False)
                     except Exception as refresh_exc:
                         refreshed_ok = False
                         log("account %s: token refresh after 401 failed: %s"
@@ -15193,7 +15190,8 @@ def probe_account(account, model=None, timeout=30):
            "realm": account.realm, "model": model, "ok": False, "elapsed_ms": 0,
            "status": None, "reply": "", "error": "", "network": False}
     chat_url = account.chat_base_url() + CHAT_PATH
-    test_body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+    test_body = {"model": model,
+                 "messages": [{"role": "user", "content": "你是什么模型"}],
                  "stream": False}
     probe_body = build_upstream_body(test_body)
     cli_identity = account.is_cli_identity()
@@ -15234,7 +15232,7 @@ def probe_account(account, model=None, timeout=30):
     except urllib.error.HTTPError as exc:
         row["elapsed_ms"] = int((time.time() - t0) * 1000)
         try:
-            detail = read_http_error(exc, 400).decode("utf-8", "replace")
+            detail = read_http_error(exc, 2048).decode("utf-8", "replace")
         except Exception:
             detail = str(exc)
         if looks_like_local_network(exc):
@@ -15242,6 +15240,9 @@ def probe_account(account, model=None, timeout=30):
             row["error"] = "本机网络不可用：%s" % exc_detail(exc)
             account.note_error(row["error"], cooldown=0)
             return row
+        # A manual test is a real attempt too: a 401 HTML page here counts
+        # toward the same three-strike retire rule as a chat request.
+        disabled_now = account.note_auth_rejected(detail)
         # The label keeps its 80-char cut; `detail` rides along untouched so the
         # panel can show the whole upstream body on hover.
         row["status"] = exc.code
@@ -15258,6 +15259,12 @@ def probe_account(account, model=None, timeout=30):
             return row
         account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
                            cooldown=60, detail=detail)
+        if disabled_now:
+            row["disabled"] = True
+            log("account %s disabled permanently after %d consecutive "
+                "401 Authorization Required"
+                % (account.uid[:8], wb_accounts.AUTH_REJECT_THRESHOLD),
+                level="ERROR")
         row["fails"] = int(account.fails)
         return row
     except Exception as exc:
@@ -21116,16 +21123,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_accounts_login_start(self, payload):
         platform = payload.get("platform") or "CLI"
-        target_realm = payload.get("realm") or CURRENT_REALM
+        enterprise_base = str(payload.get("enterpriseBase")
+                              or payload.get("enterprise_base")
+                              or "").strip()
+        target_realm = "cn" if enterprise_base else (payload.get("realm") or CURRENT_REALM)
         try:
-            started = POOL.start_login(realm=target_realm, platform=platform)
+            started = POOL.start_login(realm=target_realm, platform=platform,
+                                       enterprise_base=enterprise_base or None)
+        except ValueError as exc:
+            return self._error(400, str(exc))
         except wb_accounts.TLSVerifyError as exc:
             # The hint already names the file/variable to fix; prefixing it
             # with "could not start login" only buries it.
             return self._error(502, str(exc))
         except Exception as exc:
             return self._error(502, "could not start login: %s" % exc)
-        log("oauth login started (realm=%s, platform=%s, state=%s)" % (target_realm, platform, started["state"][:8]))
+        log("oauth login started (realm=%s, platform=%s, enterprise=%s, state=%s)"
+            % (target_realm, platform, started.get("enterpriseBase") or "-",
+               started["state"][:8]))
         return self._json(200, started)
 
     def _route_accounts_login_cancel(self, payload):

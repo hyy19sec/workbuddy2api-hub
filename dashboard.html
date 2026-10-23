@@ -5793,6 +5793,17 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
             <input type="radio" name="loginRealm" value="intl" id="radioIntl" onchange="switchLoginRealm(this.value)">
             <span><b>国际版</b> (www.workbuddy.ai)</span>
           </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+            <input type="radio" name="loginRealm" value="enterprise" id="radioEnterprise" onchange="switchLoginRealm(this.value)">
+            <span><b>企业版</b> (自定义地址)</span>
+          </label>
+        </div>
+        <div id="enterpriseLoginRow" style="display:none;margin-top:12px">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:6px">企业登录地址（例如 https://your-tenant.copilot.qq.com/）：</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <input id="enterpriseLoginBase" type="text" placeholder="https://&lt;tenant&gt;.copilot.qq.com/" style="flex:1;min-width:260px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg)">
+            <button class="sec" onclick="triggerLoginForSelectedRealm()">生成企业登录链接</button>
+          </div>
         </div>
       </div>
       <div class="step" id="step1"><div class="n">1</div><div class="t" id="step1Text">正在申请授权登录链接…</div></div>
@@ -6077,15 +6088,46 @@ function closeLogin(){
 function openLoginModal(targetRealm){
   openLogin();
   const realm = targetRealm || window.VIEW_REALM || "intl";
+  const isEnterprise = realm === "enterprise";
   const isCn = (realm === "cn");
   const rCn = document.getElementById("radioCn");
   const rIntl = document.getElementById("radioIntl");
+  const rEnt = document.getElementById("radioEnterprise");
+  const entRow = document.getElementById("enterpriseLoginRow");
   if(rCn) rCn.checked = isCn;
-  if(rIntl) rIntl.checked = !isCn;
+  if(rIntl) rIntl.checked = (!isCn && !isEnterprise);
+  if(rEnt) rEnt.checked = isEnterprise;
+  if(entRow) entRow.style.display = isEnterprise ? "block" : "none";
+  if(isEnterprise){
+    const linkBox = document.getElementById("loginLinkBox");
+    const statusBox = document.getElementById("loginStatus");
+    if(linkBox) linkBox.innerHTML = "";
+    if(statusBox) statusBox.textContent = "填写企业登录地址后，点「生成企业登录链接」。";
+    const s1 = document.getElementById("step1");
+    if(s1) s1.className = "step";
+    return;
+  }
   triggerLoginForSelectedRealm();
 }
 
 function switchLoginRealm(realm){
+  const entRow = document.getElementById("enterpriseLoginRow");
+  if(entRow) entRow.style.display = realm === "enterprise" ? "block" : "none";
+  if(realm === "enterprise"){
+    if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
+    if(loginState){ postJSON("/accounts/login/cancel", {state: loginState}).catch(()=>{}); loginState = null; }
+    const linkBox = document.getElementById("loginLinkBox");
+    const statusBox = document.getElementById("loginStatus");
+    if(linkBox) linkBox.innerHTML = "";
+    if(statusBox) statusBox.textContent = "填写企业登录地址后，点「生成企业登录链接」。";
+    const s1 = document.getElementById("step1");
+    const s2 = document.getElementById("step2");
+    const s3 = document.getElementById("step3");
+    if(s1) s1.className = "step";
+    if(s2) s2.className = "step";
+    if(s3) s3.className = "step";
+    return;
+  }
   triggerLoginForSelectedRealm();
 }
 
@@ -6096,7 +6138,16 @@ function restartLogin(){
 async function triggerLoginForSelectedRealm(){
   const checkedRadio = document.querySelector('input[name="loginRealm"]:checked');
   const realm = checkedRadio ? checkedRadio.value : (window.VIEW_REALM || "intl");
-  const isCn = (realm === "cn");
+  const isEnterprise = realm === "enterprise";
+  const entInput = document.getElementById("enterpriseLoginBase");
+  const enterpriseBase = entInput ? entInput.value.trim() : "";
+  if(isEnterprise && !enterpriseBase){
+    const statusBox = document.getElementById("loginStatus");
+    if(statusBox) statusBox.textContent = "请先填写企业登录地址，例如 https://your-tenant.copilot.qq.com/";
+    return;
+  }
+  const effectiveRealm = isEnterprise ? "cn" : realm;
+  const isCn = (effectiveRealm === "cn");
 
   if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
   if(loginState){ postJSON("/accounts/login/cancel", {state: loginState}).catch(()=>{}); loginState = null; }
@@ -6114,10 +6165,14 @@ async function triggerLoginForSelectedRealm(){
   if(s3) s3.className = "step";
 
   const s1Text = document.getElementById("step1Text");
-  if(s1Text) s1Text.textContent = isCn ? "正在向 copilot.tencent.com (国内版) 申请授权..." : "正在向 www.workbuddy.ai (国际版) 申请授权...";
+  if(s1Text) s1Text.textContent = isEnterprise
+    ? ("正在向 " + enterpriseBase + " (企业版) 申请授权...")
+    : (isCn ? "正在向 copilot.tencent.com (国内版) 申请授权..." : "正在向 www.workbuddy.ai (国际版) 申请授权...");
 
   try{
-    const r = await postJSON("/accounts/login/start", {platform: "CLI", realm: realm});
+    const payload = {platform: "CLI", realm: effectiveRealm};
+    if(isEnterprise) payload.enterpriseBase = enterpriseBase;
+    const r = await postJSON("/accounts/login/start", payload);
     loginState = r.state;
     if(s1) s1.className = "step done";
     if(s2) s2.className = "step active";

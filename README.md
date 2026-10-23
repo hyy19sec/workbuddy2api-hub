@@ -474,6 +474,10 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
+- **企业版 OAuth 登录**：添加账号弹窗新增「企业版」入口，输入租户登录地址（如 `https://your-tenant.copilot.qq.com/`）后，复用个人版的 `/v2/plugin/auth/state` → 浏览器授权 → `/v2/plugin/auth/token` 轮询流程；成功后自动写入 `chatBase` / `billingBase` / `enterpriseId`。
+- **修复企业额度把可用账号误判为过期**：企业账号直接走企业额度接口，不再先请求会返回 401 的个人计费接口；成功请求也会清除旧的 `token_expired` 标志。
+- **401 计数覆盖对话与手动测试**：连续 3 次 HTML `401 Authorization Required` 自动停用；对话触发的 refresh 不再重复计数，避免两次请求就误停用。
+- **账号测试提示词**改为「你是什么模型」。
 - **企业版（私有租户）账号接入**：账号可携带 `chatBase` / `billingBase`，聊天、刷新与企业额度查询都走租户自己的 host，并把 `X-Domain` / `Origin` / `Referer` 对齐到该 host；`copilot.qq.com` 域名归入国内版。导入器优先识别桌面/IDE 的 `account + auth` 结构（不再被顶层 `accounts` 资料缓存盖掉），企业账号可按 `domain` 自动推导私有 host。企业额度 `limitNum=-1` 时剩余记为“未知”而不是 0，避免保留积分护栏把可用号停用。
 - **连续 401 自动停用**：响应体包含 `401 Authorization Required` 时计数，连续 3 次（对话 / 刷新 / 签到任一链路，成功一次即清零）自动 `enabled=false` 且 `tasksEnabled=false` 并落盘；重新登录/导入或手动启用后恢复。不会误伤普通 JSON 401。
 - **导入体验**：导入弹窗先展示、再由「选择文件」打开文件选择器；接受 `.info`；弹窗内直接显示企业版凭据路径并可复制。

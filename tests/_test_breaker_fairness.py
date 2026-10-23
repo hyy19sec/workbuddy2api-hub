@@ -513,7 +513,7 @@ class RefreshOn401Tests(unittest.TestCase):
         self.calls = 0
         self.refreshes = 0
 
-        def refresh():
+        def refresh(**kwargs):
             self.refreshes += 1
             return True
 

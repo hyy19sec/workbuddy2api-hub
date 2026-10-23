@@ -353,7 +353,32 @@ TIER_TTL_SECONDS = 24 * 3600.0
 
 LOGIN_PENDING = 11217
 LOGIN_TTL_SECONDS = 600
+#: The enterprise login page's CLI client version. The tenant's
+#: /v2/plugin/auth/state answers an authUrl without it; append it to match the
+#: official CLI login link (…/login?platform=CLI&state=…&version=2.173.0).
+ENTERPRISE_LOGIN_VERSION = "2.173.0"
 USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
+
+
+def normalize_enterprise_base(raw):
+    """Validate an operator-entered enterprise login origin.
+
+    Accepts a bare host (<tenant>.copilot.qq.com) or a full URL; only the scheme and
+    netloc are kept so a pasted login URL cannot smuggle a path into the API
+    calls. Returns ``https://host[:port]``.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("enterprise login address is required")
+    if "://" not in text:
+        text = "https://" + text
+    parsed = urllib.parse.urlparse(text)
+    host = parsed.hostname or ""
+    if (parsed.scheme not in ("http", "https") or not host
+            or parsed.username or parsed.password
+            or not re.match(r"^[A-Za-z0-9.-]+$", host)):
+        raise ValueError("invalid enterprise login address: %s" % raw)
+    return "%s://%s" % (parsed.scheme, parsed.netloc)
 
 #: 签到文案判据。10001 在本仓库**不是**「签到成功」专属码：活动补偿的
 #: 「每人限领一次，您已领取过」与 content rejected 都用它，上游还会在
@@ -1849,14 +1874,20 @@ class Account(object):
             return self.chat_base
         return wb_identity.endpoint_for(self.realm, self.product)[0]
 
-    def refresh(self):
+    def refresh(self, count_auth_reject=True):
         # Serialise refreshes per account, then re-check inside the lock: the
         # upstream rotates the refresh token, so two concurrent refreshes can
         # make the second one send a token that the first already consumed.
+        #
+        # count_auth_reject=False is used by open_upstream after a chat 401:
+        # that request already counted the chat body, and counting the refresh
+        # attempt too would retire an account after two requests instead of
+        # three. Manual / scheduler refreshes keep the default so a 401 HTML
+        # page on the refresh endpoint still counts.
         with self._refresh_lock:
-            return self._refresh_locked()
+            return self._refresh_locked(count_auth_reject=count_auth_reject)
 
-    def _refresh_locked(self):
+    def _refresh_locked(self, count_auth_reject=True):
         if self.is_api_key:
             # 静态 Key 无法 refresh（refresh 端点只认 OAuth 设备流）。返回
             # False 而不是把 token_expired 置 True：这类账号按定义就是长期
@@ -1895,7 +1926,8 @@ class Account(object):
                 detail = exc.read(2048).decode("utf-8", "replace")
             except Exception:
                 detail = ""
-            disabled = self.note_auth_rejected(detail)
+            disabled = (self.note_auth_rejected(detail)
+                        if count_auth_reject else False)
             err_msg = str(exc)
             if "401" in err_msg or "Authorization" in err_msg or "Unauthorized" in err_msg:
                 self.token_expired = True
@@ -3160,6 +3192,12 @@ class Account(object):
             if ent.get("ok"):
                 return ent
             return ent
+        if self.is_enterprise():
+            # Enterprise members have no personal resource packages: the
+            # personal billing endpoint answers 401 for them. Asking it first
+            # marked the credential expired and hid a working account, so go
+            # straight to the enterprise usage endpoint.
+            return self._fetch_credits_enterprise()
         if self.realm == "cn":
             try:
                 res = self._fetch_credits_cn_detailed()
@@ -3414,6 +3452,9 @@ class Account(object):
             self.breaker_until = 0.0
             self.degrade_until = 0.0
             self.restricted_until = 0.0
+            # A served request proves the credential works; clear a stale
+            # "token expired" flag set by an unrelated endpoint's 401.
+            self.token_expired = False
             self.last_error = ""
             self.last_error_detail = ""
             self.cooldown_until = 0.0
@@ -4622,16 +4663,35 @@ class AccountPool(object):
             return None, "is ambiguous"
         return None, "was not found"
 
-    def start_login(self, realm="intl", platform="CLI"):
+    def start_login(self, realm="intl", platform="CLI", enterprise_base=None):
+        """Start an OAuth login.
+
+        ``enterprise_base`` is a private tenant (for example
+        https://<tenant>.copilot.qq.com). The tenant exposes the same
+        auth/state + auth/token + login/account endpoints as the public realm,
+        so the only differences are the base host and the account fields
+        recorded on success (chatBase/billingBase/enterpriseId).
+        """
+        enterprise = bool(str(enterprise_base or "").strip())
+        if enterprise:
+            base = normalize_enterprise_base(enterprise_base)
+            realm = "cn"
+            origin = base
+            domain = urllib.parse.urlparse(base).hostname or ""
+        else:
+            cfg = get_realm_config(realm)
+            base = cfg["chat_upstream"]
+            origin = cfg["origin"]
+            domain = cfg["domain"]
         cfg = get_realm_config(realm)
-        url = "%s%s?platform=%s" % (cfg["chat_upstream"], AUTH_STATE_PATH, urllib.parse.quote(str(platform)))
+        url = "%s%s?platform=%s" % (base, AUTH_STATE_PATH, urllib.parse.quote(str(platform)))
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "X-Requested-With": "XMLHttpRequest",
             "User-Agent": cfg["billing_ua"],
-            "Origin": cfg["origin"],
-            "Referer": cfg["origin"] + "/",
+            "Origin": origin,
+            "Referer": origin + "/",
         }
         payload = http_json(url, data=b"{}", method="POST", headers=headers,
                             timeout=30, retries=3, log=self.log)
@@ -4640,9 +4700,20 @@ class AccountPool(object):
         auth_url = data.get("authUrl")
         if not state or not auth_url:
             raise RuntimeError("auth/state returned no state/authUrl: %s" % payload)
+        if enterprise and "version=" not in auth_url:
+            auth_url += ("&" if "?" in auth_url else "?") + "version=" + ENTERPRISE_LOGIN_VERSION
         with self._lock:
-            self.logins[state] = {"created": time.time(), "platform": platform, "realm": realm}
-        return {"state": state, "authUrl": auth_url, "realm": realm, "platform": platform}
+            self.logins[state] = {
+                "created": time.time(),
+                "platform": platform,
+                "realm": realm,
+                "base": base,
+                "origin": origin,
+                "domain": domain,
+                "enterprise": enterprise,
+            }
+        return {"state": state, "authUrl": auth_url, "realm": realm,
+                "platform": platform, "enterpriseBase": base if enterprise else ""}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -4655,14 +4726,16 @@ class AccountPool(object):
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("realm") or "intl"
         cfg = get_realm_config(realm)
-        url = "%s%s?state=%s" % (cfg["chat_upstream"], AUTH_TOKEN_PATH, urllib.parse.quote(state))
+        base = info.get("base") or cfg["chat_upstream"]
+        origin = info.get("origin") or cfg["origin"]
+        url = "%s%s?state=%s" % (base, AUTH_TOKEN_PATH, urllib.parse.quote(state))
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "X-Requested-With": "XMLHttpRequest",
             "User-Agent": cfg["billing_ua"],
-            "Origin": cfg["origin"],
-            "Referer": cfg["origin"] + "/",
+            "Origin": origin,
+            "Referer": origin + "/",
         }
         try:
             payload = http_json(url, method="GET", headers=headers, timeout=30, retries=2)
@@ -4679,8 +4752,9 @@ class AccountPool(object):
             return {"status": "pending", "message": "waiting for token"}
         uid = jwt_uid(token)
         nickname = ""
+        profile_data = {}
         try:
-            acct_url = "%s%s?state=%s" % (cfg["chat_upstream"], LOGIN_ACCOUNT_PATH, urllib.parse.quote(state))
+            acct_url = "%s%s?state=%s" % (base, LOGIN_ACCOUNT_PATH, urllib.parse.quote(state))
             acct_headers = dict(headers)
             acct_headers["Authorization"] = "Bearer " + token
             req_acct = urllib.request.Request(acct_url, method="GET", headers=acct_headers)
@@ -4689,20 +4763,36 @@ class AccountPool(object):
                 profile_data = profile.get("data") or {}
                 nickname = str(profile_data.get("nickname") or "")
         except Exception: pass
-        account = Account({
+        enterprise = bool(info.get("enterprise"))
+        domain = data.get("domain") or info.get("domain") or cfg["domain"]
+        kwargs = {
             "uid": uid,
             "nickname": nickname or uid[:8],
-            "domain": data.get("domain") or cfg["domain"],
+            "domain": domain,
             "realm": realm,
             "platform": info["platform"],
             "accessToken": token,
             "refreshToken": data.get("refreshToken") or "",
             "expiresAt": normalize_epoch(data.get("expiresAt")) or jwt_exp(token),
-            "source": "oauth",
+            "source": "enterprise-oauth" if enterprise else "oauth",
             "enabled": True,
-        })
+        }
+        if enterprise:
+            enterprise_id = str(profile_data.get("enterpriseId")
+                                or profile_data.get("enterprise_id") or "")
+            if not enterprise_id:
+                enterprise_id = str(_jwt_claims(token).get("enterprise_id") or "")
+            if not enterprise_id and str(domain).endswith(".copilot.qq.com"):
+                enterprise_id = str(domain).split(".", 1)[0]
+            kwargs.update({
+                "chatBase": base,
+                "billingBase": base,
+                "enterpriseId": enterprise_id,
+                "product": "cli",
+            })
+        account = Account(kwargs)
         self.add(account)
-        if realm == "cn":
+        if realm == "cn" and not enterprise:
             try: account.checkin(trigger="account_add")
             except Exception: pass
         with self._lock: self.logins.pop(state, None)
