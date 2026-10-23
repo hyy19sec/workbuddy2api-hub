@@ -5859,6 +5859,16 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象，
         以及桌面客户端的 <code>{"account":…,"auth":…}</code> 格式。
       </p>
+      <div class="hint" style="margin:0 0 12px;padding:8px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;word-break:break-all">
+        企业版（CodeBuddy IDE）凭据路径：<br>
+        <code id="enterpriseImportPath" style="user-select:all">%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info</code>
+        <button class="sec mini" style="margin-left:6px" onclick="copyEnterpriseImportPath()">复制路径</button>
+        <br><span style="color:var(--dim2)">WorkBuddy 桌面版的 workbuddy-desktop.info 是加密的，请用「扫描桌面客户端账号」。</span>
+      </div>
+      <div style="margin:0 0 12px">
+        <button class="sec" id="btnChooseImportFile" onclick="chooseImportFile()">选择文件</button>
+        <span class="hint" style="margin-left:8px">先打开这个弹窗，再点这里选择文件。</span>
+      </div>
       <div id="importBody"><p class="hint">尚未选择文件。</p></div>
     </div>
     <div class="modal-ft">
@@ -6128,6 +6138,17 @@ async function copyLoginLink(){
   if(!link) return;
   try{
     await writeClipboard(link.getAttribute("href"));
+    toast('已复制到剪贴板', 'ok');
+  }catch(e){
+    toast('复制失败: ' + e.message, 'bad');
+  }
+}
+
+async function copyEnterpriseImportPath(){
+  const el = document.getElementById('enterpriseImportPath');
+  if(!el) return;
+  try{
+    await writeClipboard(el.textContent.trim());
     toast('已复制到剪贴板', 'ok');
   }catch(e){
     toast('复制失败: ' + e.message, 'bad');
@@ -9399,16 +9420,25 @@ function openImport(){
   const m = document.getElementById('importModal');
   const body = document.getElementById('importBody');
   const ow = document.getElementById('importOverwrite');
+  const btn = document.getElementById('btnImportCommit');
   if(ow) ow.checked = false;
-  if(body) body.innerHTML = '<p class="hint">正在打开文件…</p>';
+  if(btn){ btn.disabled = true; btn.textContent = '确认导入'; }
+  if(body) body.innerHTML = '<p class="hint">点「选择文件」选择账号 JSON / 企业版 .info 文件。</p>';
+  // Show the modal first; the OS file dialog is modal too, so opening it
+  // immediately used to leave this dialog unclickable behind it.
   if(m) m.classList.add('show');
+}
+
+function chooseImportFile(){
   // The picker is created per call so choosing the same file twice still fires.
   const picker = document.createElement('input');
   picker.type = 'file';
-  picker.accept = '.json,application/json';
+  // .info is the extension the desktop/IDE clients use for the same JSON
+  // credential document; don't make the operator rename it first.
+  picker.accept = '.json,.info,application/json';
   picker.onchange = () => {
     const f = picker.files && picker.files[0];
-    if(!f){ closeImport(); return; }
+    if(!f) return;  // cancelled: keep this dialog open
     readImportFile(f);
   };
   picker.click();
@@ -9477,7 +9507,7 @@ function closeImport(){
   if(m) m.classList.remove('show');
   importRows = null;
   const btn = document.getElementById('btnImportCommit');
-  if(btn) btn.disabled = true;
+  if(btn){ btn.disabled = true; btn.textContent = '确认导入'; }
 }
 
 async function readImportFile(file){
@@ -9489,8 +9519,12 @@ async function readImportFile(file){
     catch(e){ throw new Error('文件不是合法 JSON'); }
 
     // Accept the export document, a bare array, or a single account object.
+    // A desktop/IDE credential (account+auth) wins over its `accounts`
+    // profile cache — that cache carries no tokens, so letting it shadow
+    // account+auth made enterprise credential files import as "no accessToken".
     let rows;
-    if(Array.isArray(doc)) rows = doc;
+    if(doc && doc.auth && doc.account) rows = [doc];
+    else if(Array.isArray(doc)) rows = doc;
     else if(doc && Array.isArray(doc.accounts)) rows = doc.accounts;
     else if(doc && (doc.accessToken || doc.auth)) rows = [doc];
     else throw new Error('文件里没有找到账号（既没有 accounts 数组，也不是单个账号）');

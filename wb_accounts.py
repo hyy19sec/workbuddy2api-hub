@@ -453,7 +453,11 @@ def normalize_epoch(value):
 #: codebuddy.cn → workbuddy.cn（新版国内客户端的 JWT issuer 就是
 #: https://www.workbuddy.cn/…），三个都得认；只认前两个会把 workbuddy.cn 的
 #: 国内账号判成国际版——手动导入 JSON 时"明明是国内的却进了国际版"就是这么来的。
-CN_REALM_MARKERS = ("copilot.tencent.com", "codebuddy.cn", "workbuddy.cn")
+# copilot.qq.com is the private-tenant (enterprise) CN deployment
+# (for example https://<tenant>.copilot.qq.com); its issuer/domain carries no
+# other realm marker.
+CN_REALM_MARKERS = ("copilot.tencent.com", "codebuddy.cn", "workbuddy.cn",
+                    "copilot.qq.com")
 INTL_REALM_MARKERS = ("workbuddy.ai", "codebuddy.ai")
 REALM_MARKERS = {"cn": CN_REALM_MARKERS, "intl": INTL_REALM_MARKERS}
 
@@ -661,6 +665,9 @@ try:
 except (TypeError, ValueError):
     FAIL_WINDOW = 600.0
 DEGRADE_THRESHOLD = 5           # consecutive unknown failures before degrading
+# Consecutive edge-level "401 Authorization Required" bodies before the account
+# is retired (disabled) instead of being retried forever.
+AUTH_REJECT_THRESHOLD = 3
 DEGRADE_COOLDOWN = 600.0        # first degrade window: 10 minutes
 DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
 # 上游账号级风控限制（HTTP 403 / code 11140「账号存在异常行为，已被限制使用」）
@@ -781,6 +788,12 @@ class Account(object):
             self.realm = str(data.get("realm") or detect_realm_from_token(token, self.domain))
         if not self.domain:
             self.domain = get_realm_config(self.realm)["domain"]
+        # Optional per-account upstream base (an enterprise private tenant such
+        # as https://<tenant>.copilot.qq.com). Empty means "use the realm/
+        # product endpoint", which is what every ordinary account does.
+        self.chat_base = str(data.get("chatBase") or "").strip().rstrip("/")
+        # Same idea for billing / enterprise-usage calls.
+        self.billing_base = str(data.get("billingBase") or "").strip().rstrip("/")
         self.platform = str(data.get("platform") or "CLI")
         # 出站身分读回凭证档里保存的值：面板手动切换与 429 自动切换都会经由
         # save() 写进凭证档（to_dict() 序列化的是当下身分），所以重启后接着用
@@ -892,6 +905,10 @@ class Account(object):
         self.unscoped_streak = 0
         self.fails = 0
         self.degrade_count = 0
+        # Consecutive edge-level "401 Authorization Required" answers. Runtime
+        # only, like the other streaks; any success clears it. At the threshold
+        # the account is disabled and that bit *is* persisted.
+        self.auth401_fails = 0
         self.breaker_until = 0.0
         self.degrade_until = 0.0
         # 最近一次记失败的时刻：FAIL_WINDOW 用它判断「连续」是否还成立。
@@ -1011,6 +1028,8 @@ class Account(object):
             "uid": self.uid,
             "nickname": self.nickname,
             "domain": self.domain,
+            "chatBase": self.chat_base,
+            "billingBase": self.billing_base,
             "realm": self.realm,
             "platform": self.platform,
             "product": self.product,
@@ -1089,6 +1108,8 @@ class Account(object):
             "uid": self.uid,
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
             "domain": self.domain,
+            "chatBase": self.chat_base,
+            "billingBase": self.billing_base,
             "realm": self.realm,
             "platform": self.platform,
             "product": self.product,
@@ -1713,6 +1734,10 @@ class Account(object):
                 headers["X-No-Enterprise-Id"] = "1"
             if self.realm == "cn":
                 headers["X-Product"] = "SaaS"
+            if self.billing_base:
+                headers["X-Domain"] = self.domain or self.billing_base
+                headers["Origin"] = self.billing_base
+                headers["Referer"] = self.billing_base + "/"
             # 官方 CLI 全包没有设备 token 逻辑，CLI 身份一律不发。
             device_token = self._device_token() if not self.is_cli_identity() else ""
             if device_token:
@@ -1751,6 +1776,13 @@ class Account(object):
                 "Accept-Language": "en-US" if self.realm == "intl" else "zh-CN",
             }
         headers.update(identity)
+        if self.chat_base:
+            # Private tenant: the identity builder fills X-Domain from the
+            # public realm endpoint, which the tenant edge rejects. Point the
+            # domain/origin at the account's own host instead.
+            headers["X-Domain"] = self.domain or self.chat_base
+            headers["Origin"] = self.chat_base
+            headers["Referer"] = self.chat_base + "/"
         # 国际版不发 X-Device-Token（#448）；国内版保留真实 token 语义。
         # VSCode 非企业号仍按官方 token || error 的失败态发占位（#431）。
         device_token = (self._device_token()
@@ -1808,7 +1840,13 @@ class Account(object):
         return True
 
     def chat_base_url(self):
-        """这个帐号目前身分该打的端点。"""
+        """这个帐号目前身分该打的端点。
+
+        企业租户有自己的 host（凭据里的 domain），普通账号留空走区域/身分的
+        规范端点。
+        """
+        if self.chat_base:
+            return self.chat_base
         return wb_identity.endpoint_for(self.realm, self.product)[0]
 
     def refresh(self):
@@ -1829,7 +1867,7 @@ class Account(object):
             self._set_last_error("no refresh token; sign in again")
             return False
         cfg = get_realm_config(self.realm)
-        url = cfg["chat_upstream"] + REFRESH_PATH
+        url = (self.chat_base or cfg["chat_upstream"]) + REFRESH_PATH
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
@@ -1849,6 +1887,25 @@ class Account(object):
         try:
             payload = http_json(url, data=b"{}", method="POST", headers=headers, timeout=30,
                                 proxy=self.proxy)
+        except urllib.error.HTTPError as exc:
+            # A revoked/sessionless credential gets the edge's HTML 401 page
+            # here too. Feed it to the shared counter so enough consecutive
+            # rejections retire the account instead of retrying it forever.
+            try:
+                detail = exc.read(2048).decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            disabled = self.note_auth_rejected(detail)
+            err_msg = str(exc)
+            if "401" in err_msg or "Authorization" in err_msg or "Unauthorized" in err_msg:
+                self.token_expired = True
+                self._set_last_error(
+                    "登录已过期 (HTTP 401)，请重新登录"
+                    + ("；连续 %d 次 401，账号已停用" % AUTH_REJECT_THRESHOLD
+                       if disabled else ""))
+            else:
+                self._set_last_error("refresh failed: %s" % exc)
+            return False
         except Exception as exc:
             err_msg = str(exc)
             if "401" in err_msg or "Authorization" in err_msg or "Unauthorized" in err_msg:
@@ -1871,6 +1928,7 @@ class Account(object):
         with self._throttle_lock:
             self.last_error = ""
             self.cooldown_until = 0
+            self.auth401_fails = 0
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
         return True
@@ -2479,6 +2537,8 @@ class Account(object):
             state = checkin_state(code, msg)
             if state in ("checked", "already"):
                 self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                with self._throttle_lock:
+                    self.auth401_fails = 0
                 if self.path and os.path.exists(os.path.dirname(self.path)):
                     self.save(os.path.dirname(self.path))
                 return {"ok": True, "state": state, "code": code, "msg": msg,
@@ -2487,6 +2547,10 @@ class Account(object):
         except urllib.error.HTTPError as exc:
             try:
                 raw_b = exc.read().decode("utf-8") or "{}"
+                if self.note_auth_rejected(raw_b):
+                    return {"ok": False,
+                            "error": "HTTP 401 (account disabled after %d consecutive "
+                                     "401 Authorization Required)" % AUTH_REJECT_THRESHOLD}
                 body = json.loads(raw_b)
                 code = body.get("code")
                 msg = body.get("msg") or ("HTTP %d" % exc.code)
@@ -2495,6 +2559,8 @@ class Account(object):
                 state = checkin_state(code, msg)
                 if state == "already":
                     self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                    with self._throttle_lock:
+                        self.auth401_fails = 0
                     if self.path and os.path.exists(os.path.dirname(self.path)):
                         self.save(os.path.dirname(self.path))
                     return {"ok": True, "state": state, "code": code, "msg": msg,
@@ -2904,7 +2970,7 @@ class Account(object):
         # 静态 Key 必须走 /v2 前缀（见 ENTERPRISE_USAGE_PATH_V2 的注释）。
         path = (ENTERPRISE_USAGE_PATH_V2 if self.is_api_key
                 else ENTERPRISE_USAGE_PATH)
-        url = cfg["billing_upstream"] + path
+        url = (self.billing_base or cfg["billing_upstream"]) + path
         headers = self.headers(purpose="billing")
         headers["X-Client-Platform"] = "web"
         try:
@@ -2922,7 +2988,10 @@ class Account(object):
         except (TypeError, ValueError):
             size = 0.0
         # 上游只给额度与已用；已用超过额度（或额度缺失）时不要算出负余额。
-        remain = round(max(0.0, size - used), 2) if size > 0 else 0.0
+        # limitNum = -1 表示企业侧没有给出周期额度（不限量/由管理员控制），
+        # 这时 remain 必须是「未知」而不是 0：0 会触发保留积分护栏，把账号
+        # 当成余额耗尽直接停用。
+        remain = round(max(0.0, size - used), 2) if size > 0 else None
 
         cycle_start = str(data.get("cycleStartTime") or "")
         cycle_end = str(data.get("cycleEndTime") or data.get("cycleResetTime") or "")
@@ -2960,8 +3029,8 @@ class Account(object):
             "remain": remain,
             "used": used,
             "size": size,
-            "used_percent": ("%.1f%%" % (used / size * 100)) if size > 0 else "0.0%",
-            "remain_percent": ("%.1f%%" % (remain / size * 100)) if size > 0 else "100.0%",
+            "used_percent": ("%.1f%%" % (used / size * 100)) if size > 0 else "—",
+            "remain_percent": ("%.1f%%" % (remain / size * 100)) if size > 0 else "—",
             "is_paid_user": True,
             "is_enterprise": True,
             "checkin": None,
@@ -3149,6 +3218,41 @@ class Account(object):
             actual_cooldown = 3 if single_account else cooldown
             self.cooldown_until = time.time() + actual_cooldown
 
+    def note_auth_rejected(self, body):
+        """Count an edge-level "401 Authorization Required" response body.
+
+        The upstream answers a revoked/sessionless credential with an HTML
+        page (`<title>401 Authorization Required</title>`), not a JSON OAuth
+        error. After `AUTH_REJECT_THRESHOLD` consecutive ones the account is
+        disabled permanently: the session is gone, and retrying it only adds
+        a failed attempt to every round. A successful chat / refresh / check-in
+        resets the streak.
+
+        Returns True when this call performed the disable (so the caller can
+        log it). The `enabled`/`tasksEnabled` bits are written to the
+        credential file and survive restarts; re-login or import replaces the
+        record and the new Account starts enabled again.
+        """
+        text = (body.decode("utf-8", "replace")
+                if isinstance(body, (bytes, bytearray)) else str(body or ""))
+        if "401 authorization required" not in text.lower():
+            return False
+        with self._throttle_lock:
+            self.auth401_fails += 1
+            if self.auth401_fails < AUTH_REJECT_THRESHOLD or not self.enabled:
+                return False
+            self.enabled = False
+            # A retired credential cannot run tasks either. Keep the two
+            # switches in step with what set_enabled() does.
+            self.tasks_enabled = False
+            self.cooldown_until = 0.0
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            try:
+                self.save(os.path.dirname(self.path))
+            except Exception:
+                pass
+        return True
+
     def note_restricted(self, detail="", cooldown=None):
         """上游账号级风控限制（403 / code 11140）：按小时冷却，且不随重启消失。
 
@@ -3304,6 +3408,7 @@ class Account(object):
             self.unscoped_streak = 0
             self.fails = 0
             self.degrade_count = 0
+            self.auth401_fails = 0
             self.last_fail_at = 0.0
             self.last_soft_at = 0.0
             self.breaker_until = 0.0
@@ -3879,6 +3984,10 @@ class AccountPool(object):
                                  if tasks_enabled is not None
                                  else bool(enabled))
         if enabled:
+            # A manual re-enable is the operator's decision to give it another
+            # chance: start the 401 streak from zero, not from the count that
+            # retired it. Re-login/import creates a fresh Account anyway.
+            account.auth401_fails = 0
             account.clear_error()
         account.save(self.dir)
         self.apply_proxy_slots()
@@ -4883,6 +4992,13 @@ def _coerce_account_rows(blob):
     """
     if isinstance(blob, list):
         rows = blob
+    elif (isinstance(blob, dict) and isinstance(blob.get("auth"), dict)
+          and isinstance(blob.get("account"), dict)):
+        # Desktop/IDE credential file. Its top-level `accounts` array is a
+        # profile cache without tokens, so it must not shadow account+auth:
+        # that shadowing is why importing a CodeBuddy IDE credential verbatim
+        # reported "no accessToken".
+        rows = [blob]
     elif isinstance(blob, dict) and isinstance(blob.get("accounts"), list):
         # Our own export document (or any object carrying an accounts array).
         rows = blob["accounts"]
@@ -4985,14 +5101,30 @@ def normalise_import_row(row, realm=None):
     if not uid:
         raise ValueError("cannot determine uid (no uid field and no sub claim)")
 
+    enterprise_id = str(pick("enterpriseId") or "")
+    domain = domain_for_realm(detected, pick("domain"))
+    chat_base = str(pick("chatBase") or "").strip().rstrip("/")
+    billing_base = str(pick("billingBase") or "").strip().rstrip("/")
+    if not chat_base and enterprise_id and domain:
+        # A private tenant's credential only works on its own host. Public
+        # realms keep the empty override and use the canonical endpoint.
+        canonical = {get_realm_config("cn")["domain"],
+                     get_realm_config("intl")["domain"],
+                     "www.codebuddy.cn", "www.workbuddy.cn", "www.workbuddy.ai"}
+        if domain.lower() not in canonical:
+            chat_base = "https://" + domain
+            billing_base = billing_base or chat_base
+
     tasks_enabled = pick("tasksEnabled")
     return {
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
-        "domain": domain_for_realm(detected, pick("domain")),
+        "domain": domain,
+        "chatBase": chat_base,
+        "billingBase": billing_base,
         "realm": detected,
         "platform": str(pick("platform") or "CLI"),
-        "enterpriseId": str(pick("enterpriseId") or ""),
+        "enterpriseId": enterprise_id,
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),
         "expiresAt": (0 if api_key

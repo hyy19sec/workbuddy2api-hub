@@ -10230,7 +10230,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.32",
+        "version": "1.7.33",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -14774,6 +14774,21 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             if exc.code == 401:
                 if session_key and POOL:
                     POOL.affinity.demote(session_key, account.uid)
+                detail = http_error_detail(exc, 2048)
+                # OAuth accounts get a refresh attempt below; that attempt
+                # counts its own 401 body, so the same request is not counted
+                # twice. API keys / accounts without a refresh token have no
+                # such fallback, so they count here.
+                if (not getattr(account, "refresh_token", "")
+                        or getattr(account, "is_api_key", False)):
+                    if account.note_auth_rejected(detail):
+                        log("account %s disabled permanently after %d consecutive "
+                            "401 Authorization Required"
+                            % (account.uid[:8],
+                               wb_accounts.AUTH_REJECT_THRESHOLD),
+                            level="ERROR")
+                        last_error = exc
+                        continue
                 if account.uid not in refreshed:
                     refreshed.add(account.uid)
                     try:
@@ -14792,7 +14807,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
                 account.note_error("HTTP 401",
                                    cooldown=60,
-                                   single_account=(total <= 1))
+                                   single_account=(total <= 1),
+                                   detail=detail)
                 last_error = exc
                 continue
             if exc.code == 400:
@@ -18070,7 +18086,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.32"
+    server_version = "wb-proxy/1.7.33"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。

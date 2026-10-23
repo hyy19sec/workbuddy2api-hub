@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.32-2496ED?style=flat-square" alt="Version 1.7.32"></a>
+  <a href="https://github.com/hyy19sec/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.33-2496ED?style=flat-square" alt="Version 1.7.33"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -160,7 +160,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 - 211 个套件：157 个 Python + 54 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - 211 个套件：157 个 Python + 54 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 226 个套件：167 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 227 个套件：168 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - 211 个套件：157 个 Python + 54 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
@@ -474,6 +474,9 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
+- **企业版（私有租户）账号接入**：账号可携带 `chatBase` / `billingBase`，聊天、刷新与企业额度查询都走租户自己的 host，并把 `X-Domain` / `Origin` / `Referer` 对齐到该 host；`copilot.qq.com` 域名归入国内版。导入器优先识别桌面/IDE 的 `account + auth` 结构（不再被顶层 `accounts` 资料缓存盖掉），企业账号可按 `domain` 自动推导私有 host。企业额度 `limitNum=-1` 时剩余记为“未知”而不是 0，避免保留积分护栏把可用号停用。
+- **连续 401 自动停用**：响应体包含 `401 Authorization Required` 时计数，连续 3 次（对话 / 刷新 / 签到任一链路，成功一次即清零）自动 `enabled=false` 且 `tasksEnabled=false` 并落盘；重新登录/导入或手动启用后恢复。不会误伤普通 JSON 401。
+- **导入体验**：导入弹窗先展示、再由「选择文件」打开文件选择器；接受 `.info`；弹窗内直接显示企业版凭据路径并可复制。
 - **修复动态取色对比度不足，并说明 `file://` 无法登录面板**（#536）：色彩配置此前只给低对比度标 ⚠，仍然实时应用并写入 `localStorage`，下次打开时调色台是收起状态，用户看不到警告；半透明表面还可能被输入框的十六进制格式当成黑色。现在正文、信号色与主按钮字按实际背景（含 `rgba()` 叠加）计算 WCAG 对比度，低于 `4.5:1` 时以当前内置主题色为基准向黑白方向夹取，输入框、导出值与持久化值同步为校正后的颜色，已有不达标配置也会在加载时纠正。直接双击 `dashboard.html` 时不再发相对请求后显示 `Failed to fetch`，而是在登录闸门内提示改用 `http://127.0.0.1:8788/`。启动后自动打开面板仍保持显式 opt-in，不改变无头 / 服务器部署的默认行为。新增 2 个 JS 套件（对比度与 `file://` 登录各 1 个），完整套件 226 项。 / Fix low-contrast custom themes and explain why opening the panel from disk cannot log in (#536): the colour tuner used to mark low contrast with ⚠ but still applied and persisted the value, and the tuner is closed on the next load, so the warning was invisible; translucent surfaces could also turn black in the hex colour inputs. Body text, signal colours and button labels are now checked against their real backgrounds (including `rgba()` compositing) and clamped toward black or white from the active built-in palette when below `4.5:1`; the input, exported values and persisted values all receive the corrected colour, and a previously saved non-compliant palette is fixed on load. Opening `dashboard.html` directly now shows an instruction to use `http://127.0.0.1:8788/` instead of sending a relative request and reporting `Failed to fetch`. Auto-opening the dashboard after startup remains explicit opt-in, so headless and server deployments keep their current behaviour. Two new JS suites (contrast and `file://` login), 226 suites in total.
 
 - **恢复模型别名映射，并修掉后台别名误伤显式模型选择**（#617 / #619）：`accounts/settings.json` 里的 `model_aliases` 在 v1.7.29 已成为死配置，Claude Desktop 3p 只能发 `claude-*`，实际模型 id 又会被它的模型选择器过滤，导致两边的可用模型都为空。现在启动后首次 POST 会读取别名表（兼容旧的 `{别名: 目标}` 对象与 `[{from, to}]` 列表两种写法），在协议转换和选号前统一改写；未知名称原样透传。同时确认 #619 不是上游静默改道：网关自己的后台模型改写只看模型名，把用户从选择器显式选中的 `gpt-5.6-terra` / `gpt-5.6-luna` 也改成了 `deepseek-v4.1-flash`。现在只有 `client_metadata` 明确表示 `memory` / `compaction` 等后台任务时才改写。新增 `tests/_test_model_alias_and_realm.py`（14 项）及后台改写断言。 / Restore model aliases and stop the background rewrite from touching an explicit picker choice (#617 / #619): `model_aliases` in `accounts/settings.json` had been a dead setting since v1.7.29, while Claude Desktop 3p only exposes `claude-*` names and filters real model ids out of its picker, leaving neither side usable. The first POST after startup now loads the alias table (the legacy `{alias: target}` object and the `[{from, to}]` list both work), resolves it before protocol translation and account selection, and passes unknown names through unchanged. Separately, #619 was not an upstream silent redirect: the gateway's own background rewrite matched on the model name alone and also replaced a user's explicit `gpt-5.6-terra` / `gpt-5.6-luna` choice with `deepseek-v4.1-flash`. It now rewrites only when `client_metadata` identifies a background job such as `memory` or `compaction`. Added `tests/_test_model_alias_and_realm.py` (14 tests) and background-rewrite assertions.
