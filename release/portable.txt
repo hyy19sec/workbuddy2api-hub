@@ -75,6 +75,7 @@ wb_update_external.py
 wb_update_portable.py
 wb_update_request.py
 wb_upstream_pool.py
+wb_usage_today.py
 wb_webagent.py
 wb_webprompts.py
 wb_webtools.py

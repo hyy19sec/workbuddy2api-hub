@@ -341,7 +341,13 @@ class RuntimeTrimTests(unittest.TestCase):
         self.assertTrue(needed)
         covered = set(portable_runtime.REQUIRED_FILES)
         missing = [m for m in needed
-                   if ("Lib/%s.py" % m) not in covered and ("Lib/%s/__init__.py" % m) not in covered]
+                   if ("Lib/%s.py" % m) not in covered
+                   and ("Lib/%s/__init__.py" % m) not in covered
+                   # Built-in extension modules (unicodedata) ship as a DLL,
+                   # not as a Lib/ source file; the DLL entry in REQUIRED_FILES
+                   # is the same guarantee.
+                   and ("DLLs/%s.pyd" % m) not in covered
+                   and ("DLLs/_%s.pyd" % m) not in covered]
         self.assertEqual(missing, [], "这些导入没有出现在运行时常量表里：%s" % missing)
 
     def test_the_documented_trim_is_exactly_what_goes(self):
